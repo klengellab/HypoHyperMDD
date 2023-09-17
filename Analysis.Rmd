@@ -1,0 +1,633 @@
+---
+title: "Divergent transcriptomic profiles in depressed individuals with hyper- and hypophagia implicating inflammatory status"
+author: "Shu Dan"
+date: '2023-07-28'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, cache=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache.lazy = FALSE)
+# rm(list = ls(all = TRUE))
+options(stringsAsFactors = FALSE)
+# options(lintr.exclude = "# skip lint")
+set.seed(707)
+
+dataDirectory <- "/data/klengellab/RNAseq/lholsen" 
+outDirectory <- "/Volumes/TOSHIBA EXT/LH_bwh/ERIS/out-v1"
+v <- "-v1"
+library(S4Vectors)
+# Load packages required for analysis
+cran <- c("knitr", "kableExtra", "openxlsx", "irlba", "dplyr", "Hmisc", "Rmisc", 
+"pheatmap",  "qqman",  "RColorBrewer", "tximport","ggplot2", "ggrepel", "factoextra", 
+"ggfortify", "ggpmisc", "readxl")
+
+if(!require(devtools)) install.packages("devtools")
+ devtools::install_github("kassambara/factoextra")
+ devtools::install_github("husson/FactoMineR")
+
+bioc <- c( "sva", "limma", "bacon", "QCEWAS", "GenomicRanges", "DEGreport", "AnnotationHub", 
+"ensembldb", "clusterProfiler",  "edgeR","biomaRt","Category","GO.db","SparseM", "topGO")
+
+install.cran <- !unlist(lapply(cran, library, character.only = TRUE, logical.return = TRUE))
+install.bioc <- !unlist(lapply(bioc, library, character.only = TRUE, logical.return = TRUE))
+
+if(sum(install.cran) > 0){
+    invisible(lapply(cran[install.cran], install.packages, method = "curl"))
+}
+if(sum(install.bioc) > 0){
+    invisible(lapply(bioc[install.bioc], BiocManager::install))
+}
+invisible(lapply(c(cran, bioc), require, character.only = TRUE, quietly = TRUE))
+rm(cran, bioc, install.cran, install.bioc)
+
+library("tidyverse")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(readr)
+
+# Set working directory
+if(!dir.exists(outDirectory)) dir.create(outDirectory)
+knitr::opts_knit$set(root.dir = outDirectory)
+setwd(outDirectory)
+
+# Source custom functions
+source("/Volumes/TOSHIBA EXT/scripts/custom.PCA.R") 
+source("/Volumes/TOSHIBA EXT/LH_bwh/ERIS/de.R") 
+```
+
+
+
+### Final Version, last updated `r Sys.Date()`
+
+This is the in depth differential expression analysis with interaction models of RNAseq for the WHISPR study. In the previous version, we explored whether to include breakfast intake and the correlation with different clinical measures. We've decided to include total breakfast intake and correlate with all available clinial variables. 
+
+- **Baseline**: subset for t0, repeated measures for individual, no cell type/SV, no condition, include breakfast intake, look for baseline group differences. 
+- **t105 interaction**: group and condition interaction model, repeated measure, no cell type/SV
+
+
+```{r load-data}
+load("count_metadata_exc.RDa")
+ah <- AnnotationHub()
+human_ens <- query(ah, c("Homo sapiens", "EnsDb"))
+human_ens <- human_ens[["AH89426"]]
+
+d0 <- DGEList(count)
+rownames(d0) <- genes
+padj.cutoff <- 0.05
+metadata$visit <- substring(metadata$samplename, 8)
+metadata$id <- substring(metadata$visit, 1, 6)
+```
+
+
+# Baseline - T0
+
+```{r t0-baseline-bfast-tot, fig.height=3, fig.width=2}
+metadata_t0 <- metadata[metadata$timepoint == "t0",]
+metadata_v2_goi_count.t0 <- read_csv("../metadata_v2_goi_count_t0.csv")
+metadata_t0 <- cbind(metadata_t0, metadata_v2_goi_count.t0[,c(6:7, 49, 51:57)])
+metadata_t0_to_match <- metadata_t0[, c("sample",colnames(metadata_t0)[39:49])]
+metadata_bfast <- merge(metadata, metadata_t0_to_match,by.x = "sample", by.y = "sample", all.x = TRUE)
+bfast_cols <- colnames(metadata_t0)[39:49]
+
+library(tidyverse)
+metadata_bfast <- metadata_bfast %>% fill(all_of(bfast_cols))
+rownames(metadata_bfast) <- rownames(metadata)
+
+design.group.bfast.tot <- model.matrix(~ Group + Age + BMI + Sex + exonic_rate + bfast_pvcTOT, data = metadata_bfast)
+colnames(design.group.bfast.tot) <- c("Intercept","Group", "Age", "BMI", "F", "exonic_rate", "bfast_pvcTOT")
+design.group.bfast.tot.t0 <- design.group.bfast.tot[rownames(design.group.bfast.tot) %in% rownames(metadata_t0),]
+
+library(DESeq2)
+v.bfast.tot <- filter_count(d0, design.group.bfast.tot, metadata_bfast)
+
+## Calculate blocking random effect
+keep <- filterByExpr(d0, design.group.bfast.tot)
+d_keep <- d0[keep, keep.lib.sizes = FALSE]
+dupcor.bfast.tot <- duplicateCorrelation(v.bfast.tot,design.group.bfast.tot,block=metadata_bfast$individual)
+
+v.dup.bfast.tot <- voom(d_keep, design.group.bfast.tot, plot=FALSE, block=metadata_bfast$individual, correlation=dupcor.bfast.tot$consensus)
+v.dup.bfast.tot.t0 <-  v.dup.bfast.tot[,match(rownames(metadata_t0), colnames(v.dup.bfast.tot))]
+```
+
+## PCA association
+
+```{r pca-t0, fig.height=4}
+# pca.p <- custom.PCA(v.dup.bfast.tot.t0$E,
+#           pd = metadata_t0[,!colnames(metadata_t0) %in% c("description",
+#                                                            "sample",
+#                                                            "samplename", "rn", 
+#                                                           "TADA2B", "id", "subject_id", 
+#                                                           "ctq", "CD4T", "CD8T", "Monocytes", "Unknown",
+#                                                           "B", "NK", "bfast_percCARB", "bfast_percFAT", "bfast_percPROT")],
+#           RGEffect = TRUE,
+#           PDFplot = FALSE,
+#           Rplot = TRUE,
+#           cex.axis = 0.7,
+#           adjust.p = TRUE,
+#           return.p = TRUE)
+# kable(pca.p) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+
+col_to_plot <- c("Group","Condition", "timepoint", "individual",
+           "debq_ext", "debq_emot", "debq_restr",
+          "bfast_pvcTOT", "bfast_pvcPROT","bfast_pvcFAT", "bfast_pvcCARB", "RIN","RNA_extraction_batch",
+          "sequences_flagged_as_poor_quality", "sequence_length",
+          "percent_gc", "r_rna", "r_rna_rate", "x5_3_bias", "intergenic_rate", "intronic_rate",
+          "exonic_rate", "duplication_rate_of_mapped", "average_insert_size", "total_reads","mapped_reads",
+          "mapped_paired_reads", "duplicates", "average_read_length", "duplicates_pct")
+
+## Rename the colnames for plotting purposes
+pd_plot <- metadata_t0[, col_to_plot]
+colnames(pd_plot) <- c("Group","Condition", "Time Point", "Individual",
+           "DEBQ Ext", "DEBQ Emot", "DEBQ Restr",
+          "bfast_pvcTOT", "bfast_pvcPROT","bfast_pvcFAT", "bfast_pvcCARB", "RIN","RNA_extraction_batch",
+          "sequences_flagged_as_poor_quality", "sequence_length",
+          "percent_gc", "r_rna", "r_rna_rate", "x5_3_bias", "intergenic_rate", "intronic_rate",
+          "exonic_rate", "duplication_rate_of_mapped", "average_insert_size", "total_reads","mapped_reads",
+          "mapped_paired_reads", "duplicates", "average_read_length", "duplicates_pct")
+
+## SVG graphics device
+svg(file = "pca-t0.svg", width = 8, height = 10)
+pca.p <- custom.PCA(v.dup.bfast.tot.t0$E,
+          pd = pd_plot,
+          RGEffect = TRUE,
+          PDFplot = FALSE,
+          Rplot = TRUE,
+          cex.axis = 0.7,
+          adjust.p = TRUE,
+          return.p = TRUE)
+dev.off()
+kable(pca.p) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+```
+
+
+## Differential Gene Expression
+
+```{r de-t0}
+svg(file = "TADA2B.svg", width = 3, height = 5)
+res.limma.group.t0.block.list.bfast <- subset_de_analysis(metadata_t0, design.group.bfast.tot.t0, v.dup.bfast.tot, "Group", block = metadata_t0$individual, correlation = dupcor.bfast.tot$consensus, ens = human_ens, plot = TRUE, x_axis_label = c("Hypophagic", "Hyperphagic"))
+dev.off()
+
+library(kableExtra)
+if(sum(res.limma.group.t0.block.list.bfast[[1]]$baconPadj < padj.cutoff) > 0){
+  kable(res.limma.group.t0.block.list.bfast[[2]], caption = "Differentially Expressed Genes (genes with Padj &lt; p-adj cutoff)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+} else{
+  kable(res.limma.group.t0.block.list.bfast[[2]][1:10,], caption = "Top 10 DE (none have Padj &lt;  p-adj cutoff)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+}
+
+```
+
+
+The results look slightly deflated before bacon adjustment but closer to 1 after bacon. There are `r dim(res.limma.group.t0.block.list.bfast[[1]][res.limma.group.t0.block.list.bfast[[1]]$baconPadj < 0.05,])[1]` significant genes after bacon adjustment and `r dim(res.limma.group.t0.block.list.bfast[[1]][res.limma.group.t0.block.list.bfast[[1]]$adj.P.Val < 0.05,])[1]` before. `r nrow(res.limma.group.t0.block.list.bfast[[2]][res.limma.group.t0.block.list.bfast[[2]]$logFC > 0,])` genes are found to be up-regulated while `r nrow(res.limma.group.t0.block.list.bfast[[2]][res.limma.group.t0.block.list.bfast[[2]]$logFC < 0,])` genes are found to be down-regulated between group.
+
+## Enrichment Analysis
+
+### Gene Ontology Analysis
+
+```{r t0-go-bk}
+sig_res.limma.t0.dup.bfast.nominal <- res.limma.group.t0.block.list.bfast[[1]][res.limma.group.t0.block.list.bfast[[1]]$baconP < 0.05,]
+
+sig_res.limma.t0.dup.bfast.nominal.go <- GO_analysis(res.limma.group.t0.block.list.bfast[[1]]$gene_id, sig_res.limma.t0.dup.bfast.nominal$gene_id,sig_res.limma.t0.dup.bfast.nominal$logFC, org.Hs.eg.db)
+
+sig.go <- sig_res.limma.t0.dup.bfast.nominal.go[sig_res.limma.t0.dup.bfast.nominal.go$p.adjust <= 0.05,]
+sig.mf <- sig.go[sig.go$ONTOLOGY == "MF",]
+sig.bp <- sig.go[sig.go$ONTOLOGY == "BP",]
+
+kable(sig.mf, caption = "Significant Molecular Function terms") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+kable(sig.bp, caption = "Significant Biological Process terms") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+```
+
+
+### Gene Set Enrichment Analysis with reference from de Kluiver et al.
+
+Pathways are derived from the [de Kluiver et al](https://pubmed.ncbi.nlm.nih.gov/31431611/)
+
+```{r msigdb-related-paper-inflam}
+library(msigdbr)
+# library(msigdb)
+library(ExperimentHub)
+library(GSEABase)
+library(readxl)
+library(stringr)
+eh = ExperimentHub()
+query(eh , 'msigdb')
+m_df <- msigdbr(species = "Homo sapiens")
+
+## read in the pathways 
+paper_ref_pathways <- read_excel("/data/klengellab/RNAseq/lholsen/analysis/out-v1/paper_162_pathways.xlsx")
+paper_ref_pathways$to_match <- str_replace_all(paper_ref_pathways$Pathway," ", "_")
+paper_ref_pathways <- as.data.frame(sapply(paper_ref_pathways, toupper))
+paper_ref_pathways$to_match <- str_replace_all(paper_ref_pathways$to_match,"-", "")
+paper_ref_pathways$to_match <- str_replace_all(paper_ref_pathways$to_match,"/", "_")
+
+## Match reference pathways with the database pathway
+m_df_ref <- m_df[m_df$gs_name %in% paper_ref_pathways$to_match,]
+
+## Check the ones that weren't matched with the reference pathways
+not_matched <- paper_ref_pathways$to_match[!paper_ref_pathways$to_match %in% unique(m_df_ref$gs_name)]
+
+## Read in the newer downloaded gmt and see if can find the not matched pathways
+gmt_file_list <- list.files("/data/klengellab/RNAseq/lholsen/analysis/not_matched", full.names = TRUE)
+gmt_list <- lapply(gmt_file_list, read.gmt)
+gmt_list_concat <- data.frame()
+for(i in 1:length(gmt_list)){
+  # print(i)
+  gmt_list_concat <- rbind(gmt_list[[i]], gmt_list_concat)
+}
+
+## Map all the other information from msigdbr to the not matched pathway genes
+gmt_list_concat$ensembl_gene <- m_df[match(gmt_list_concat$gene, m_df$gene_symbol),]$ensembl_gene
+gmt_list_concat$ensembl_gene[gmt_list_concat$gene == "BCL10-AS1"] <- "ENSG00000223653"
+gmt_list_concat$ensembl_gene[gmt_list_concat$gene == "FCGR1BP"] <- "ENSG00000198019"
+
+names(gmt_list_concat) <- c("gs_name", "gene_symbol", "ensembl_gene")
+paper_ref_pathways_all <- rbind(m_df_ref %>% dplyr::select(starts_with(c("gs_name", "gene_symbol", "ensembl_gene"))), gmt_list_concat)
+write.csv(paper_ref_pathways_all, file = "../de_Kluiver_ref_pathways_all.csv")
+```
+
+```{r gsea-ref-baseline}
+# Let's create a named vector ranked based on the log2 fold change values
+# sig_res.limma.t0.dup.bfast.nominal <- sig_res.limma.t0.dup.bfast.nominal[!is.na(sig_res.limma.t0.dup.bfast.nominal$gene_name),]
+# lfc_vector <- sig_res.limma.t0.dup.bfast.nominal$logFC
+# names(lfc_vector) <- sig_res.limma.t0.dup.bfast.nominal$gene_name
+
+res.limma.group.t0.block.list.bfast.gsea <- res.limma.group.t0.block.list.bfast[[1]][!is.na(res.limma.group.t0.block.list.bfast[[1]]$gene_name),]
+lfc_vector <- res.limma.group.t0.block.list.bfast.gsea$logFC
+names(lfc_vector) <- res.limma.group.t0.block.list.bfast.gsea$gene_name
+
+# We need to sort the log2 fold change values in descending order here
+lfc_vector <- sort(lfc_vector, decreasing = TRUE)
+
+gsea_results.t0 <- GSEA(
+  geneList = lfc_vector, # Ordered ranked gene list
+  minGSSize = 5, # Minimum gene set size
+  maxGSSize = 1400, # Maximum gene set set
+  pvalueCutoff = 0.1, # p-value cutoff
+  eps = 0, # Boundary for calculating the p value
+  seed = TRUE, # Set seed to make results reproducible
+  pAdjustMethod = "fdr", # Benjamini-Hochberg correction
+  TERM2GENE = paper_ref_pathways_all
+)
+
+```
+
+
+Pathways including `r gsea_results.t0@result[["ID"]]` are enriched in our comparison. 
+
+## Clinical Data
+
+Correlate normalized DEG counts with the following clinical data
+- log(Cortisol)
+- log(Ghrelin)
+- MoodVAS sad and tense
+- DEBQ emot, ext, restr
+- Breakfast intake breakdown (planned vs. consumed and % macronutrient)
+
+```{r clinical-baseline}
+metadata_v3 <- read_excel("/Volumes/TOSHIBA EXT/LH_bwh/ERIS/Data_For_Daisy-updated.xlsx", sheet = "New")
+
+metadata_debq <- read_excel("/Volumes/TOSHIBA EXT/LH_bwh/ERIS/Data_For_Daisy.xlsx")
+metadata_v2 <- read.csv("/Volumes/TOSHIBA EXT/LH_bwh/ERIS/metadata_edit.csv")
+
+metadata_v2$log2Cortisol <- log2(metadata_v2$Cortisol)
+metadata_v2$log2Ghrelin <- log2(metadata_v2$Ghrelin)
+
+metadata_v2$group.condition <- paste(metadata_v2$Group, metadata_v2$Condition, sep = ".")
+metadata_v2$group.condition <- factor(metadata_v2$group.condition, level = c("Hypo.NS", "Hypo.S", "Hyper.NS", "Hyper.S"))
+
+metadata_v2$visit <- substring(metadata_v2$samplename, 8)
+
+## DEBQ trait
+metadata_v2$debq_ext <- metadata_debq$debq_ext[match(metadata_v2$individual, tolower(metadata_debq$subject_id))]
+metadata_v2$debq_emot <- metadata_debq$debq_emot[match(metadata_v2$individual, tolower(metadata_debq$subject_id))]
+metadata_v2$debq_restr <- metadata_debq$debq_restr[match(metadata_v2$individual, tolower(metadata_debq$subject_id))]
+
+metadata_debq <- metadata_debq[tolower(metadata_debq$subject_id) %in% metadata_t0$individual,]
+
+### Match back with gene counts
+t0_group_gene <- res.limma.group.t0.block.list.bfast[[2]]$gene_id
+
+## Grab counts of GOI
+goi_count.t0 <- as.data.frame(v.dup.bfast.tot.t0$E[rownames(v.dup.bfast.tot.t0) %in% t0_group_gene,])
+colnames(goi_count.t0) <- res.limma.group.t0.block.list.bfast[[2]]$gene_name
+t0_group_gene_name <- res.limma.group.t0.block.list.bfast[[2]]$gene_name
+
+## Correlate with all clinical measures
+metadata_v2.t0 <- metadata_v2[metadata_v2$timepoint == "t0",]
+metadata_v2_goi_count.t0 <- cbind(metadata_v2.t0, t(goi_count.t0))
+
+goi_count.t0 <- data.frame(t(goi_count.t0))
+goi_1_t0 <- goi_count.t0 %>% dplyr::select(ends_with("1_t0"))
+rownames(goi_1_t0) <- paste0(rownames(goi_1_t0), "_1")
+metadata_debq.t0.v1<- cbind(metadata_debq, t(goi_1_t0))
+
+goi_2_t0 <- goi_count.t0 %>% dplyr::select(ends_with("2_t0"))
+rownames(goi_2_t0) <- paste0(rownames(goi_2_t0), "_2")
+metadata_debq.t0.v2<- cbind(metadata_debq.t0.v1, t(goi_2_t0))
+metadata_debq.t0.v2$TADA2B <- rowMeans(subset(metadata_debq.t0.v2, select = c(TADA2B_1, TADA2B_2)), na.rm = TRUE)
+
+scores_to_average <- as.data.frame(t(metadata_t0))
+avg_visit <- function(col_to_average, scores_to_average, metadata){
+  scores_to_average.visit1 <- scores_to_average %>% dplyr::select(ends_with("1_t0"))
+  scores_to_average.visit1 <- scores_to_average.visit1[col_to_average,]
+  rownames(scores_to_average.visit1) <- paste0(rownames(scores_to_average.visit1), "_1")
+  r1 <- rownames(scores_to_average.visit1)
+  metadata.visit1<- cbind(metadata, t(scores_to_average.visit1))
+  
+  scores_to_average.visit2 <- scores_to_average %>% dplyr::select(ends_with("2_t0"))
+  scores_to_average.visit2 <- scores_to_average.visit2[col_to_average,]
+  rownames(scores_to_average.visit2) <- paste0(rownames(scores_to_average.visit2), "_2")
+  r2 <- rownames(scores_to_average.visit2)
+  metadata.visit2<- cbind(metadata.visit1, t(scores_to_average.visit2))
+  # metadata <- cbind(metadata, rowMeans(subset(metadata.visit2, select = c(rownames(scores_to_average.visit1), rownames(scores_to_average.visit2))), na.rm = TRUE))
+  metadata.visit2 <- metadata.visit2 %>% mutate_all(as.numeric)
+  avg <- rowMeans(subset(metadata.visit2, select = c(r1, r2)), na.rm = TRUE)
+  
+  return(avg)
+}
+
+### Need to do the same average for breakfast intake as well
+bfast_cols <- bfast_cols[6:9]
+avg_bfast <- t(do.call(rbind, lapply(bfast_cols, avg_visit, scores_to_average, metadata_debq.t0.v2)))
+colnames(avg_bfast) <- bfast_cols
+metadata_debq.t0.v2 <- cbind(metadata_debq.t0.v2, avg_bfast)
+
+```
+
+
+
+```{r get-tada2b-cor}
+## linear model for gene counts against all other clinical measures
+col_oi <- c("log2Cortisol", "log2Ghrelin", "MoodVAS_sad","MoodVAS_tense")
+lm_correlation_flip <-function(gene_col, metadata, col_oi, covar, plot = FALSE, repeated_measures = TRUE) {
+    lapply(col_oi, function(measure_col,
+                            metadata,
+                            gene_col,
+                            covar, plot, repeated_measures) {
+     
+      if(repeated_measures){
+        message('running repeated measures mixed-effects model')
+        require(lme4) ## For repeated measures
+        gene_count <- metadata[, c(gene_col,  measure_col, covar, "subject_id")]
+
+        lme_model <-
+          formula(paste0(gene_col, " ~ ", paste(
+            c(measure_col, covar, "(1|subject_id)"), collapse = "+"
+          )))
+        # print(lme_model)
+        fit = lmer(lme_model, data = gene_count)
+        print(car::Anova(fit))
+        print(summary(fit))
+      }else{
+        message('running mixed-effects model without repeated measures')
+
+        ## Without repeated measures
+        gene_count <- metadata[, c(gene_col,  measure_col, covar)]
+        model <- as.formula(paste0(gene_col, " ~ ", paste(c(measure_col,covar), collapse= "+")))
+        print(model)
+        fit <- summary(lm(model,data = gene_count))
+        print(fit)
+      }
+      
+      
+      # Plots will be the same as above anyways for now
+      if (plot) {
+        ggscatter(
+          gene_count,
+          x = gene_col,
+          y = measure_col,
+          add = "reg.line",
+          conf.int = TRUE,
+          cor.coef = TRUE,
+          cor.method = "pearson",
+          xlab = "Normalized Gene Counts",
+          ylab = str(measure_col),
+          title = gene_col
+        )
+      }
+      return(fit)
+    }, metadata, gene_col, covar, plot, repeated_measures)
+  }
+
+metadata_v2_goi_count.t0$subject_id <- metadata_v2_goi_count.t0$individual
+metadata_v2_goi_count.t0 <- cbind(metadata_v2_goi_count.t0, metadata_t0[,bfast_cols])
+col_oi_bfast <- c(col_oi, bfast_cols)
+lapply(t0_group_gene_name, lm_correlation_flip, metadata_v2_goi_count.t0, col_oi_bfast, covar = c("Sex"))
+
+debq_cols <- c("debq_emot", "debq_ext", "debq_restr")
+lapply(t0_group_gene_name, lm_correlation_flip, metadata_debq.t0.v2, debq_cols, covar = c("sex"), repeated_measures = FALSE)
+
+```
+
+
+
+
+
+# Group + Condition - T105 
+
+Because of the multiple groups that we're interested in, we made a combined variable with group and condition for contrast groups. Using this, we can ask the following questions all at once while controlling for individual, sequencing depth, sex, age and BMI: 
+
+- Which genes respond to stress in the hypo group (hypo.S vs. hypo.NS)
+- Which genes respond to stress in the hyper group (hyper.S vs. hyper.NS)
+- Which genes respond differently to stress in the hyper vs. hypo group?  (hyper.S - hyper.NS) - (hypo.S - hypo.NS)
+
+```{r subset-count-t105-bfast-tot}
+metadata$group.condition <- paste(metadata$Group, metadata$Condition, sep = ".")
+metadata$group.condition <- factor(metadata$group.condition, level = c("Hypo.NS", "Hypo.S", "Hyper.NS", "Hyper.S"))
+metadata_bfast$group.condition <- metadata$group.condition
+design.combined.bfast.tot <- model.matrix(~ 0 + group.condition + Age + BMI + Sex + exonic_rate + bfast_pvcTOT, data = metadata_bfast)
+colnames(design.combined.bfast.tot) <- c(levels(metadata$group.condition), "Age", "BMI", "F","exonic_rate", "bfast_pvcTOT")
+
+keep <- filterByExpr(d0, design.combined.bfast.tot)
+d_keep <- d0[keep, keep.lib.sizes = FALSE]
+v.combined.bfast.tot <- voom(d_keep, design.combined.bfast.tot, plot = FALSE)
+
+dupcor.combined.bfast <- duplicateCorrelation(v.combined.bfast.tot, design.combined.bfast.tot, block=metadata_bfast$individual)
+v.dup.combined.bfast <- voom(d_keep, design.combined.bfast.tot, plot=FALSE, block=metadata_bfast$individual, correlation=dupcor.combined.bfast$consensus)
+
+metadata_bfast_t105 <- metadata_bfast[metadata_bfast$timepoint == "t105",]
+metadata_bfast_t105 <- as.data.frame(metadata_bfast_t105)
+rownames(metadata_bfast_t105) <- metadata_bfast_t105$sample
+
+metadata_t105 <- metadata[metadata$timepoint == "t105",]
+v.dup.combined.bfast.t105 <- v.dup.combined.bfast[,colnames(v.dup.combined.bfast) %in% rownames(metadata_t105)]
+
+```
+
+## PCA association
+
+```{r pca-t105, fig.height=4}
+metadata_v2_goi_count.t105 <- read.csv("/Volumes/TOSHIBA EXT/LH_bwh/ERIS/metadata_v2_goi_count_t105.csv")
+
+# pca.p <- custom.PCA(v.dup.combined.bfast.t105$E,
+#           pd = cbind(metadata_bfast_t105[,!colnames(metadata_bfast_t105) %in% c("description",
+#                                                            "sample",
+#                                                            "samplename", "rn", 
+#                                                           "id", "subject_id", "TADA2B",
+#                                                           "ctq", "CD4T", "CD8T", "Monocytes", "Unknown",
+#                                                           "B", "NK", "bfast_percCARB", "bfast_percFAT", "bfast_percPROT")], metadata_v2_goi_count.t105[,colnames(metadata_v2_goi_count.t105) %in% c("RIN", "RNA_extraction_batch")]),
+#           RGEffect = TRUE,
+#           PDFplot = FALSE,
+#           Rplot = TRUE,
+#           cex.axis = 0.7,
+#           adjust.p = TRUE,
+#           return.p = TRUE)
+# kable(pca.p) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+col_to_plot <- c("Group","Condition", "timepoint", "individual",
+           "debq_ext", "debq_emot", "debq_restr",
+          "bfast_pvcTOT", "bfast_pvcPROT","bfast_pvcFAT", "bfast_pvcCARB", "RIN","RNA_extraction_batch",
+          "sequences_flagged_as_poor_quality", "sequence_length",
+          "percent_gc", "r_rna", "r_rna_rate", "x5_3_bias", "intergenic_rate", "intronic_rate",
+          "exonic_rate", "duplication_rate_of_mapped", "average_insert_size", "total_reads","mapped_reads",
+          "mapped_paired_reads", "duplicates", "average_read_length", "duplicates_pct")
+
+pd_plot <- metadata_v2_goi_count.t105[, col_to_plot]
+colnames(pd_plot) <- c("Group","Condition", "Time Point", "Individual",
+           "DEBQ Ext", "DEBQ Emot", "DEBQ Restr",
+          "bfast_pvcTOT", "bfast_pvcPROT","bfast_pvcFAT", "bfast_pvcCARB", "RIN","RNA_extraction_batch",
+          "sequences_flagged_as_poor_quality", "sequence_length",
+          "percent_gc", "r_rna", "r_rna_rate", "x5_3_bias", "intergenic_rate", "intronic_rate",
+          "exonic_rate", "duplication_rate_of_mapped", "average_insert_size", "total_reads","mapped_reads",
+          "mapped_paired_reads", "duplicates", "average_read_length", "duplicates_pct")
+
+## SVG graphics device
+svg(file = "pca-t105.svg", width = 8, height = 10)
+pca.p <- custom.PCA(v.dup.combined.bfast.t105$E,
+          pd = pd_plot,
+          RGEffect = TRUE,
+          PDFplot = FALSE,
+          Rplot = TRUE,
+          cex.axis = 0.7,
+          adjust.p = TRUE,
+          return.p = TRUE)
+dev.off()
+```
+
+
+```{r group-condition-t105-bfast-tot, fig.width=2, fig.height=3}
+rownames(design.combined.bfast.tot) <- metadata_bfast$sample
+
+design.combined.bfast.tot.t105 <- design.combined.bfast.tot[rownames(design.combined.bfast.tot) %in% rownames(metadata_t105),]
+
+# Make Contrast
+cont.matrix.t105.bfast.tot <- makeContrasts(
+  SvsNinHypo = Hypo.S-Hypo.NS,
+  SvsNinHyper = Hyper.S-Hyper.NS,
+  Diff =  (Hyper.S-Hyper.NS)-(Hypo.S-Hypo.NS),
+  levels = design.combined.bfast.tot.t105
+)
+
+res.limma.group.condition.t105.block.bfast.tot.list <- subset_de_analysis(metadata_bfast_t105, design.combined.bfast.tot, v.dup.combined.bfast, 
+                                                                contrasts = cont.matrix.t105.bfast.tot, coef = "Diff", block = metadata_bfast_t105$individual, 
+                                                                correlation = dupcor.combined.bfast$consensus, ens = human_ens)
+
+if(sum(res.limma.group.condition.t105.block.bfast.tot.list[[1]]$baconPadj < padj.cutoff) > 0){
+  kable(res.limma.group.condition.t105.block.bfast.tot.list[[2]], caption = "Differentially Expressed Genes (genes with Padj &lt; p-adj cutoff)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+} else{
+  kable(res.limma.group.condition.t105.block.bfast.tot.list[[1]][1:10,], caption = "Top 10 DE (none have Padj &lt;  p-adj cutoff)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+}
+
+svg(file = "CCDC196.svg", width = 5, height = 5)
+lapply(res.limma.group.condition.t105.block.bfast.tot.list[[2]]$gene_id[1], plot_combined, res.limma.group.condition.t105.block.bfast.tot.list[[1]], v.dup.combined.bfast.t105$E, metadata_t105, c("Hypophagic \n No Stress", "Hypophagic \nStress", "Hyerphagic \nNo Stress", "Hyerphagic \nStress"))
+dev.off()
+
+svg(file = "SPATA33.svg", width = 5, height = 5)
+lapply(res.limma.group.condition.t105.block.bfast.tot.list[[2]]$gene_id[2], plot_combined, res.limma.group.condition.t105.block.bfast.tot.list[[1]], v.dup.combined.bfast.t105$E, metadata_t105, c("Hypophagic \n No Stress", "Hypophagic \nStress", "Hyerphagic \nNo Stress", "Hyerphagic \nStress"))
+dev.off()
+
+```
+
+
+The results look slightly deflated before bacon adjustment but closer to 1 after bacon. There are `r dim(res.limma.group.condition.t105.block.bfast.tot.list[[1]][res.limma.group.condition.t105.block.bfast.tot.list[[1]]$baconPadj < 0.05,])[1]` significant genes after bacon adjustment and `r dim(res.limma.group.condition.t105.block.bfast.tot.list[[1]][res.limma.group.condition.t105.block.bfast.tot.list[[1]]$adj.P.Val < 0.05,])[1]` before. `r nrow(res.limma.group.condition.t105.block.bfast.tot.list[[2]][res.limma.group.condition.t105.block.bfast.tot.list[[2]]$logFC > 0,])` genes are found to be up-regulated while `r nrow(res.limma.group.condition.t105.block.bfast.tot.list[[2]][res.limma.group.condition.t105.block.bfast.tot.list[[2]]$logFC < 0,])` genes are found to be down-regulated between group.
+
+
+## Enrichment Analysis
+
+### Gene Ontology Analysis
+
+Since we didn't see a lot of significant genes after bacon adjustment, we'll use the significant genes from the nominal p-values. 
+
+```{r t105-go}
+sig_res.limma.combined.bfast.t105.dup.nominal <- res.limma.group.condition.t105.block.bfast.tot.list[[1]][res.limma.group.condition.t105.block.bfast.tot.list[[1]]$baconP < 0.05,]
+sig_res.limma.combined.bfast.t105.dup.go <- GO_analysis(res.limma.group.condition.t105.block.bfast.tot.list[[1]]$gene_id, sig_res.limma.combined.bfast.t105.dup.nominal$gene_id, sig_res.limma.combined.bfast.t105.dup.nominal$logFC, org.Hs.eg.db)
+
+sig.go <- sig_res.limma.combined.bfast.t105.dup.go[sig_res.limma.combined.bfast.t105.dup.go$p.adjust <= 0.05,]
+sig.mf <- sig.go[sig.go$ONTOLOGY == "MF",]
+sig.bp <- sig.go[sig.go$ONTOLOGY == "BP",]
+
+kable(sig.mf, caption = "Significant Molecular Function terms") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+kable(sig.bp, caption = "Significant Biological Process terms") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+```
+
+### GSEA - reference pathways from de Kluiver.et al
+
+
+```{r gsea-ref-interaction}
+# Let's create a named vector ranked based on the log2 fold change values
+res.limma.group.condition.t105.block.bfast.tot.list.gsea <-
+  res.limma.group.condition.t105.block.bfast.tot.list[[1]][!is.na(res.limma.group.condition.t105.block.bfast.tot.list[[1]]$gene_name),]
+lfc_vector <- res.limma.group.condition.t105.block.bfast.tot.list.gsea$logFC
+names(lfc_vector) <- res.limma.group.condition.t105.block.bfast.tot.list.gsea$gene_name
+
+# We need to sort the log2 fold change values in descending order here
+lfc_vector <- sort(lfc_vector, decreasing = TRUE)
+
+gsea_results.t105 <- GSEA(
+  geneList = lfc_vector, # Ordered ranked gene list
+  minGSSize = 3, # Minimum gene set size
+  maxGSSize = 1400, # Maximum gene set set
+  pvalueCutoff = 0.1, # p-value cutoff
+  eps = 0, # Boundary for calculating the p value
+  seed = TRUE, # Set seed to make results reproducible
+  pAdjustMethod = "fdr", # fdr correction
+  TERM2GENE = paper_ref_pathways_all
+)
+```
+
+No pathway is significantly enriched at this timepoint. 
+
+## Clinical Data
+
+```{r ccdc-clinical}
+## Grab counts of GOI
+t105_interaction_gene <- res.limma.group.condition.t105.block.bfast.tot.list[[2]]$gene_id
+t105_interaction_gene_name <- res.limma.group.condition.t105.block.bfast.tot.list[[2]]$gene_name
+
+goi_count.t105 <- t(as.data.frame(v.dup.combined.bfast.t105$E[rownames(v.dup.combined.bfast.t105) %in% t105_interaction_gene,]))
+colnames(goi_count.t105) <- res.limma.group.condition.t105.block.bfast.tot.list[[2]]$gene_name
+  
+## Correlate with all clinical measures
+metadata_v2.t105 <- metadata_v2[metadata_v2$timepoint == "t105",]
+metadata_v2_goi_count.t105 <- cbind(metadata_v2.t105, goi_count.t105)
+
+metadata_v2_goi_count.t105$subject_id <- metadata_v2_goi_count.t105$individual
+metadata_v2_goi_count.t105 <- cbind(metadata_v2_goi_count.t105, metadata_bfast_t105[,bfast_cols])
+# metadata_v2_goi_count.t105 <- read.csv("/data/klengellab/RNAseq/lholsen/analysis/metadata_v2_goi_count_t105.csv") 
+metadata_v2_goi_count.t105$log10Cortisol <- log10(metadata_v2_goi_count.t105$Cortisol)
+metadata_v2_goi_count.t105$log10Ghrelin <- log10(metadata_v2_goi_count.t105$Ghrelin)
+
+col_oi_bfast <- c(col_oi, bfast_cols)
+lapply(t105_interaction_gene_name, lm_correlation_flip, metadata_v2_goi_count.t105, col_oi_bfast, covar = c("Sex"))
+
+```
+
+```{r}
+## Correlate with all clinical measures
+goi_count.t105 <- data.frame(t(goi_count.t105))
+goi_1_t105 <- goi_count.t105 %>% dplyr::select(ends_with("1_t105"))
+rownames(goi_1_t105) <- paste0(rownames(goi_1_t105), "_1")
+metadata_debq.t105.v1<- cbind(metadata_v2_goi_count.t105, t(goi_1_t105)) ## because we excluded 2 samples from the t105 time point, we can't cbind
+
+goi_2_t105 <- goi_count.t105 %>% dplyr::select(ends_with("2_t105"))
+rownames(goi_2_t105) <- paste0(rownames(goi_2_t105), "_2")
+metadata_debq.t105.v2<- cbind(metadata_debq.t105.v1, t(goi_2_t105))
+metadata_debq.t105.v2$CCDC196 <- rowMeans(subset(metadata_debq.t105.v2, select = c(CCDC196_1, CCDC196_2)), na.rm = TRUE)
+metadata_debq.t105.v2$SPATA33 <- rowMeans(subset(metadata_debq.t105.v2, select = c(SPATA33_1, SPATA33_2)), na.rm = TRUE)
+
+debq_cols <- c("debq_emot", "debq_ext", "debq_restr")
+lapply(t105_interaction_gene_name, lm_correlation_flip, metadata_debq.t105.v2, debq_cols, covar = c("Sex"), repeated_measures = FALSE)
+```
+
